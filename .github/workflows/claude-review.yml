@@ -1,0 +1,343 @@
+name: Claude AI Code Review
+
+on:
+  pull_request:
+    branches:
+      - master
+      - main
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python linting tools
+        run: |
+          pip install flake8 black mypy bandit safety
+
+      - name: Run Python linters
+        id: python-lint
+        continue-on-error: true
+        run: |
+          echo "## Python Linting Results" > python-report.md
+          echo "" >> python-report.md
+
+          echo "### Flake8" >> python-report.md
+          flake8 backend/ --max-line-length=120 --exclude=__pycache__,venv --format='%(path)s:%(row)d:%(col)d: %(code)s %(text)s' > flake8-report.txt 2>&1 || true
+          if [ -s flake8-report.txt ]; then
+            echo '```' >> python-report.md
+            cat flake8-report.txt >> python-report.md
+            echo '```' >> python-report.md
+          else
+            echo "✅ No issues found" >> python-report.md
+          fi
+          echo "" >> python-report.md
+
+          echo "### Black (Code Formatting)" >> python-report.md
+          black --check backend/ > black-report.txt 2>&1 || true
+          if [ -s black-report.txt ]; then
+            echo '```' >> python-report.md
+            cat black-report.txt >> python-report.md
+            echo '```' >> python-report.md
+          else
+            echo "✅ Code is properly formatted" >> python-report.md
+          fi
+          echo "" >> python-report.md
+
+          echo "### Bandit (Security)" >> python-report.md
+          bandit -r backend/ -f txt > bandit-report.txt 2>&1 || true
+          if [ -s bandit-report.txt ]; then
+            echo '```' >> python-report.md
+            cat bandit-report.txt >> python-report.md
+            echo '```' >> python-report.md
+          else
+            echo "✅ No security issues found" >> python-report.md
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package.json
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: Run TypeScript linters
+        id: ts-lint
+        continue-on-error: true
+        run: |
+          cd frontend
+          echo "## TypeScript Linting Results" > ../ts-report.md
+          echo "" >> ../ts-report.md
+
+          echo "### ESLint" >> ../ts-report.md
+          npm run lint > ../eslint-report.txt 2>&1 || true
+          if [ -s ../eslint-report.txt ]; then
+            echo '```' >> ../ts-report.md
+            cat ../eslint-report.txt >> ../ts-report.md
+            echo '```' >> ../ts-report.md
+          else
+            echo "✅ No linting issues found" >> ../ts-report.md
+          fi
+          echo "" >> ../ts-report.md
+
+          echo "### TypeScript Type Check" >> ../ts-report.md
+          npx tsc --noEmit > ../tsc-report.txt 2>&1 || true
+          if [ -s ../tsc-report.txt ]; then
+            echo '```' >> ../ts-report.md
+            cat ../tsc-report.txt >> ../ts-report.md
+            echo '```' >> ../ts-report.md
+          else
+            echo "✅ No type errors found" >> ../ts-report.md
+          fi
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v41
+        with:
+          files: |
+            backend/**/*.py
+            frontend/**/*.{ts,tsx,js,jsx}
+            *.py
+            *.{ts,tsx}
+
+      - name: Upload lint reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-reports
+          path: |
+            python-report.md
+            ts-report.md
+          retention-days: 30
+
+  claude-review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+    needs: code-quality
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Get PR diff
+        id: pr-diff
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git diff origin/${{ github.event.pull_request.base.ref }}...HEAD > pr-diff.txt
+
+          # Limit diff size to avoid API limits
+          if [ $(wc -c < pr-diff.txt) -gt 50000 ]; then
+            echo "diff-size=large" >> $GITHUB_OUTPUT
+            head -c 50000 pr-diff.txt > pr-diff-truncated.txt
+            mv pr-diff-truncated.txt pr-diff.txt
+          else
+            echo "diff-size=normal" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download lint reports
+        uses: actions/download-artifact@v4
+        with:
+          name: lint-reports
+        continue-on-error: true
+
+      - name: Set up Python for Claude API
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install anthropic requests
+
+      - name: Run Claude Code Review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          cat > claude_review.py << 'PYTHON_SCRIPT'
+          import os
+          import anthropic
+
+          client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+          # Read the diff
+          with open("pr-diff.txt", "r", encoding="utf-8") as f:
+              diff = f.read()
+
+          # Read lint reports if available
+          python_lint = ""
+          ts_lint = ""
+          try:
+              with open("python-report.md", "r", encoding="utf-8") as f:
+                  python_lint = f.read()
+          except FileNotFoundError:
+              pass
+
+          try:
+              with open("ts-report.md", "r", encoding="utf-8") as f:
+                  ts_lint = f.read()
+          except FileNotFoundError:
+              pass
+
+          pr_title = os.environ.get("PR_TITLE", "")
+          pr_body = os.environ.get("PR_BODY", "")
+
+          prompt = f"""You are an expert code reviewer for a medical AI system (Neurosurgical Knowledge Management System).
+          This system handles sensitive medical data and must comply with HIPAA regulations.
+
+          PR Title: {pr_title}
+          PR Description: {pr_body}
+
+          Please review the following code changes and provide:
+
+          1. **Security Issues** (Priority: Critical for medical data)
+             - HIPAA compliance concerns
+             - Data sanitization and validation
+             - Authentication/authorization issues
+             - API key exposure or secrets
+             - SQL injection vulnerabilities
+             - XSS vulnerabilities
+
+          2. **Code Quality**
+             - Best practices violations
+             - Code smell and anti-patterns
+             - Performance concerns
+             - Error handling gaps
+
+          3. **Medical/Domain-Specific Concerns**
+             - Medical data handling accuracy
+             - Clinical workflow implications
+             - Data integrity for medical records
+
+          4. **Testing & Documentation**
+             - Missing tests for critical paths
+             - Unclear or missing documentation
+             - Type safety issues
+
+          5. **Positive Observations**
+             - Well-implemented features
+             - Good patterns to acknowledge
+
+          Linting Reports:
+          {python_lint}
+
+          {ts_lint}
+
+          Code Changes (Git Diff):
+          ```diff
+          {diff[:40000]}
+          ```
+
+          Please provide a structured review in markdown format. Be constructive and specific.
+          If the changes look good overall, say so! Focus on actionable feedback.
+          """
+
+          try:
+              message = client.messages.create(
+                  model="claude-sonnet-4-5-20250929",
+                  max_tokens=4096,
+                  temperature=0.3,
+                  messages=[
+                      {"role": "user", "content": prompt}
+                  ]
+              )
+
+              review = message.content[0].text
+
+              with open("claude-review.md", "w", encoding="utf-8") as f:
+                  f.write(review)
+
+              print("Review completed successfully")
+          except Exception as e:
+              print(f"Error during review: {str(e)}")
+              with open("claude-review.md", "w", encoding="utf-8") as f:
+                  f.write(f"⚠️ **Claude API Error**: {str(e)}\n\nPlease check the ANTHROPIC_API_KEY secret configuration.")
+          PYTHON_SCRIPT
+
+          python claude_review.py
+
+      - name: Post review as PR comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            let review = '## 🤖 Claude AI Code Review\n\n';
+
+            try {
+              const claudeReview = fs.readFileSync('claude-review.md', 'utf8');
+              review += claudeReview;
+            } catch (error) {
+              review += '⚠️ Could not load Claude review. Please check workflow logs.\n';
+            }
+
+            review += '\n\n---\n';
+            review += `\n*Review generated at ${new Date().toISOString()}*\n`;
+            review += `\n*Powered by Claude AI (Sonnet 4.5) • [View workflow run](${context.payload.repository.html_url}/actions/runs/${context.runId})*`;
+
+            // Find existing review comment
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.data.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('Claude AI Code Review')
+            );
+
+            if (botComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: review
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: review
+              });
+            }
+
+      - name: Upload Claude review
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-review
+          path: claude-review.md
+          retention-days: 90
